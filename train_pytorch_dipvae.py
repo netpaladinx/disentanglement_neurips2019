@@ -41,7 +41,7 @@ parser = argparse.ArgumentParser(description='VAE Example')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
 parser.add_argument('--epochs', type=int, default=100, metavar='N',
-                    help='number of epochs to train (default: 100)')
+                    help='number of epochs to train (default: 10)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='enables CUDA training')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -59,101 +59,39 @@ kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 train_loader = pyu.get_loader(batch_size=args.batch_size, **kwargs)
 
 
-def get_padding(kernel_size, stride=None, h_or_w=None):
-    unused = (h_or_w - 1) % stride if h_or_w and stride else 0
-    pad_total = kernel_size - 1
-    pad_beg = pad_total // 2
-    pad_end = pad_total - pad_beg - unused
-    return (pad_beg, pad_end, pad_beg, pad_end)
-
-
-def slice2d(x, padding):
-    pad_t, pad_b, pad_l, pad_r = padding
-    return x.narrow(2, pad_t, x.size(2) - pad_t - pad_b).narrow(3, pad_l, x.size(3) - pad_l - pad_r)
-
-
-class Lambda(nn.Module):
-    def __init__(self, fn, *args):
-        super(Lambda, self).__init__()
-        self.args = args
-        self.fn = fn
-
-    def forward(self, x):
-        return self.fn(x, *self.args)
-
-
-def conv2d(in_channels, out_channels, kernel_size, stride, bias, in_h_or_w=None):
-    if kernel_size > 1:
-        return nn.Sequential(
-            nn.ZeroPad2d(get_padding(kernel_size, stride, in_h_or_w)),
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, bias=bias))
-    else:
-        return nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, bias=bias)
-
-
-def deconv2d(in_channels, out_channels, kernel_size, stride, bias, out_h_or_w=None):
-    if kernel_size > 1:
-        return nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, bias=bias),
-            Lambda(slice2d, get_padding(kernel_size, stride, out_h_or_w)))
-    else:
-        return nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, bias=bias)
-
-
 class Encoder(nn.Module):
-    def __init__(self, n_latent=7):
+    def __init__(self):
         super(Encoder, self).__init__()
-        self.conv1 = conv2d(3, 32, 4, 2, True, 64)  # => 32 x 32, 32
-        self.conv2 = conv2d(32, 32, 4, 2, True, 32)  # => 16 x 16, 32
-        self.conv3 = conv2d(32, 64, 2, 2, True, 16)  # => 8 x 8, 64
-        self.conv4 = conv2d(64, 64, 2, 2, True, 8)  # -> 4 x 4, 64
-        self.fc = nn.Linear(1024, 256)
-        self.fc_mu = nn.Linear(256, n_latent)
-        self.fc_logvar = nn.Linear(256, n_latent)
+        self.tail = nn.Sequential(nn.Linear(4096 * 3, 400),
+                                  nn.ReLU())
+        self.head_mu = nn.Linear(400, 7)
+        self.head_logvar = nn.Linear(400, 7)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu(x)
-        x = self.conv2(x)
-        x = F.relu(x)
-        x = self.conv3(x)
-        x = F.relu(x)
-        x = self.conv4(x)
-        x = F.relu(x)
-        x = x.reshape(x.size(0), -1)
-        x = self.fc(x)
-        x = F.relu(x)
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
+        h = self.tail(x.contiguous().view(-1, 4096 * 3))
+        return self.head_mu(h), self.head_logvar(h)
 
 
-class Decoder(nn.Module):
-    def __init__(self, n_latent=7):
-        super(Decoder, self).__init__()
-        self.fc1 = nn.Linear(n_latent, 256)
-        self.fc2 = nn.Linear(256, 1024)
-        self.deconv1 = deconv2d(64, 64, 4, 2, True, 8)  # => 8 x 8, 64
-        self.deconv2 = deconv2d(64, 32, 4, 2, True, 16)  # => 16 x 16, 32
-        self.deconv3 = deconv2d(32, 32, 4, 2, True, 32)  # => 32 x 32, 32
-        self.deconv4 = deconv2d(32, 3, 4, 2, True, 64)  # => 64 x 64, 3
+class Decoder(nn.Sequential):
+    def __init__(self):
+        super(Decoder, self).__init__(nn.Linear(7, 400),
+                                      nn.ReLU(),
+                                      nn.Linear(400, 4096 * 3),
+                                      nn.Sigmoid())
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-        x = F.relu(x)
-        x = x.reshape(x.size(0), 64, 4, 4)
-        x = self.deconv1(x)
-        x = F.relu(x)
-        x = self.deconv2(x)
-        x = F.relu(x)
-        x = self.deconv3(x)
-        x = F.relu(x)
-        x = self.deconv4(x)
-        x = x.reshape(x.size(0), -1)
-        prob = torch.sigmoid(x)
-        return prob
+def covariance(x):
+    ''' x: batch_size x n_dims
+    '''
+    batch_size = x.size(0)
+    mean_x = x.mean(0, True)
+    mean_xx = x.t().mm(x) / batch_size
+    return mean_xx - mean_x.t().mm(mean_x)
+
+
+def diag_off_diag_dip(cov_matrix, l_offdiag, l_diag):
+    cov_matrix_diag = cov_matrix.diag()
+    cov_matrix_offdiag = cov_matrix - cov_matrix_diag.diag()
+    return l_offdiag * cov_matrix_offdiag.pow(2).sum() + l_diag * (cov_matrix_diag - 1).pow(2).sum()
 
 
 class RepresentationExtractor(nn.Module):
@@ -194,7 +132,7 @@ class VAE(nn.Module):
 
 
 model = VAE().to(device)
-optimizer = optim.Adam(model.parameters(), lr=0.0001, betas=(0.9, 0.999))
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 
 # Reconstruction + KL divergence losses summed over all elements and batch
@@ -205,8 +143,7 @@ def loss_function(recon_x, x, mu, logvar):
     # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
     # https://arxiv.org/abs/1312.6114
     # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    #KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    KLD = -0.5 * torch.sum(1 + logvar - logvar.exp())
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
     return BCE + KLD
 
@@ -219,6 +156,8 @@ def train(epoch):
         optimizer.zero_grad()
         recon_batch, mu, logvar = model(data)
         loss = loss_function(recon_batch, data, mu, logvar)
+        dip_loss = diag_off_diag_dip(covariance(mu), 1, 10)
+        loss += dip_loss
         loss.backward()
         train_loss += loss.item()
         optimizer.step()

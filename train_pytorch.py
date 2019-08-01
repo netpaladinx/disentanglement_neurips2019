@@ -40,7 +40,7 @@ import aicrowd_helpers
 parser = argparse.ArgumentParser(description='VAE Example')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
-parser.add_argument('--epochs', type=int, default=10, metavar='N',
+parser.add_argument('--epochs', type=int, default=100, metavar='N',
                     help='number of epochs to train (default: 10)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='enables CUDA training')
@@ -64,8 +64,8 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__()
         self.tail = nn.Sequential(nn.Linear(4096 * 3, 400),
                                   nn.ReLU())
-        self.head_mu = nn.Linear(400, 20)
-        self.head_logvar = nn.Linear(400, 20)
+        self.head_mu = nn.Linear(400, 7)
+        self.head_logvar = nn.Linear(400, 7)
 
     def forward(self, x):
         h = self.tail(x.contiguous().view(-1, 4096 * 3))
@@ -74,7 +74,7 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Sequential):
     def __init__(self):
-        super(Decoder, self).__init__(nn.Linear(20, 400),
+        super(Decoder, self).__init__(nn.Linear(7, 400),
                                       nn.ReLU(),
                                       nn.Linear(400, 4096 * 3),
                                       nn.Sigmoid())

@@ -40,8 +40,8 @@ import aicrowd_helpers
 parser = argparse.ArgumentParser(description='VAE Example')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
-parser.add_argument('--epochs', type=int, default=100, metavar='N',
-                    help='number of epochs to train (default: 100)')
+parser.add_argument('--epochs', type=int, default=10, metavar='N',
+                    help='number of epochs to train (default: 10)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='enables CUDA training')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -58,6 +58,7 @@ device = torch.device("cuda" if args.cuda else "cpu")
 kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 train_loader = pyu.get_loader(batch_size=args.batch_size, **kwargs)
 
+N_LATENT = 20
 
 def get_padding(kernel_size, stride=None, h_or_w=None):
     unused = (h_or_w - 1) % stride if h_or_w and stride else 0
@@ -101,15 +102,15 @@ def deconv2d(in_channels, out_channels, kernel_size, stride, bias, out_h_or_w=No
 
 
 class Encoder(nn.Module):
-    def __init__(self, n_latent=7):
+    def __init__(self):
         super(Encoder, self).__init__()
         self.conv1 = conv2d(3, 32, 4, 2, True, 64)  # => 32 x 32, 32
         self.conv2 = conv2d(32, 32, 4, 2, True, 32)  # => 16 x 16, 32
         self.conv3 = conv2d(32, 64, 2, 2, True, 16)  # => 8 x 8, 64
         self.conv4 = conv2d(64, 64, 2, 2, True, 8)  # -> 4 x 4, 64
         self.fc = nn.Linear(1024, 256)
-        self.fc_mu = nn.Linear(256, n_latent)
-        self.fc_logvar = nn.Linear(256, n_latent)
+        self.fc_mu = nn.Linear(256, N_LATENT)
+        self.fc_logvar = nn.Linear(256, N_LATENT)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -129,9 +130,9 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, n_latent=7):
+    def __init__(self):
         super(Decoder, self).__init__()
-        self.fc1 = nn.Linear(n_latent, 256)
+        self.fc1 = nn.Linear(N_LATENT, 256)
         self.fc2 = nn.Linear(256, 1024)
         self.deconv1 = deconv2d(64, 64, 4, 2, True, 8)  # => 8 x 8, 64
         self.deconv2 = deconv2d(64, 32, 4, 2, True, 16)  # => 16 x 16, 32
@@ -154,6 +155,43 @@ class Decoder(nn.Module):
         x = x.reshape(x.size(0), -1)
         prob = torch.sigmoid(x)
         return prob
+
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.fc1 = nn.Linear(N_LATENT, 400)
+        self.fc2 = nn.Linear(400, 400)
+        self.fc3 = nn.Linear(400, 400)
+        self.fc4 = nn.Linear(400, 2)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.leaky_relu(x)
+        x = self.fc2(x)
+        x = F.leaky_relu(x)
+        x = self.fc3(x)
+        x = F.leaky_relu(x)
+        logits = self.fc4(x)
+        logprobs = F.log_softmax(logits, 1)
+        return logits, logprobs
+
+
+def sampler(mu, logvar):
+    ''' mu: batch_size x n_latent
+        logvar: batch_size x n_latent
+    '''
+    return mu + torch.randn_like(mu) * torch.exp(logvar / 2)
+
+
+def shuffle_codes(z_sample):
+    ''' z_sample: batch_size x n_latent
+    '''
+    z_shuffle = z_sample.clone()
+    batch_size, n_latent = z_sample.size()
+    for l in range(n_latent):
+        z_shuffle[:, l] = z_shuffle[torch.randperm(batch_size), l]
+    return z_shuffle
 
 
 class RepresentationExtractor(nn.Module):
@@ -193,8 +231,10 @@ class VAE(nn.Module):
         return self.decoder(z), mu, logvar
 
 
-model = VAE().to(device)
-optimizer = optim.Adam(model.parameters(), lr=0.0001, betas=(0.9, 0.999))
+vae_model = VAE().to(device)
+vae_optimizer = optim.Adam(vae_model.parameters(), lr=0.0001, betas=(0.9, 0.999))
+discr_model = Discriminator().to(device)
+discr_optimizer = optim.Adam(discr_model.parameters(), lr=0.0001, betas=(0.5, 0.9))
 
 
 # Reconstruction + KL divergence losses summed over all elements and batch
@@ -205,31 +245,65 @@ def loss_function(recon_x, x, mu, logvar):
     # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
     # https://arxiv.org/abs/1312.6114
     # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    #KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    KLD = -0.5 * torch.sum(1 + logvar - logvar.exp())
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-    return BCE + KLD
+    return BCE, KLD
 
 
 def train(epoch):
-    model.train()
-    train_loss = 0
+    vae_model.train()
+    discr_model.train()
+
+    recon_loss_metric = 0
+    kl_loss_metric = 0
+    tc_loss_metric = 0
+    discr_loss_metric = 0
+    factor_vae_loss_metric = 0
     for batch_idx, data in enumerate(train_loader):
         data = data.to(device).float()
-        optimizer.zero_grad()
-        recon_batch, mu, logvar = model(data)
-        loss = loss_function(recon_batch, data, mu, logvar)
-        loss.backward()
-        train_loss += loss.item()
-        optimizer.step()
+
+        recon_batch, mu, logvar = vae_model(data)
+
+        steps_for_discr = 10
+        for _ in range(steps_for_discr):
+            z_sample = sampler(mu, logvar)
+            z_shuffle = shuffle_codes(z_sample.detach())
+            _, logprobs_z_sample = discr_model(z_sample.detach())  # logits_z_sample: batch_size x 2 (0: gen, 1: tar)
+            _, logprobs_z_shuffle = discr_model(z_shuffle)
+
+            discr_loss = - logprobs_z_sample[:, 0].mean() * 0.5 - logprobs_z_shuffle[:, 1].mean() * 0.5
+            discr_loss_metric += discr_loss.item() / steps_for_discr
+
+            discr_optimizer.zero_grad()
+            discr_loss.backward()
+            discr_optimizer.step()
+
+        recon_loss, kl_loss = loss_function(recon_batch, data, mu, logvar)
+        logits_z_sample, _ = discr_model(z_sample)
+        tc_loss = (logits_z_sample[:, 0] - logits_z_sample[:, 1]).mean()
+        factor_vae_loss = recon_loss + 10 * kl_loss + 100 * tc_loss
+        recon_loss_metric += recon_loss.item()
+        kl_loss_metric += kl_loss.item()
+        tc_loss_metric += tc_loss.item()
+        factor_vae_loss_metric += factor_vae_loss.item()
+
+        vae_optimizer.zero_grad()
+        factor_vae_loss.backward()
+        vae_optimizer.step()
+
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\trecon: {:.6f}\tkl: {:.6f}\ttc: {:.6f}\tdiscr: {:.6f}\t'
+                  'factorvae: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader),
-                loss.item() / len(data)))
+                recon_loss.item() / len(data), kl_loss.item() / len(data), tc_loss.item() / len(data),
+                discr_loss.item() / len(data), factor_vae_loss.item() / len(data)))
 
-    print('====> Epoch: {} Average loss: {:.4f}'.format(
-          epoch, train_loss / len(train_loader.dataset)))
+    print('====> Epoch: {} Average recon loss: {:.4f}\tkl loss: {:.4f}\ttc loss: {:.4f}\tdiscr loss: {:.4f}\t'
+          'factorvae loss: {:.4f}'.format(
+        epoch, recon_loss_metric / len(train_loader.dataset), kl_loss_metric / len(train_loader.dataset),
+        tc_loss_metric / len(train_loader.dataset), discr_loss_metric / len(train_loader.dataset),
+        factor_vae_loss_metric / len(train_loader.dataset)))
 
 
 if __name__ == '__main__':
@@ -242,7 +316,7 @@ if __name__ == '__main__':
     # Almost done...
     aicrowd_helpers.register_progress(0.90)
     # Export the representation extractor
-    pyu.export_model(RepresentationExtractor(model.encoder, 'mean'),
+    pyu.export_model(RepresentationExtractor(vae_model.encoder, 'mean'),
                      input_shape=(1, 3, 64, 64))
     # Done!
     aicrowd_helpers.register_progress(1.0)
